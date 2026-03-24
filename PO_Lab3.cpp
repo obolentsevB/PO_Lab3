@@ -9,14 +9,15 @@
 #include <algorithm>
 #include <atomic>
 #include <iomanip>
+#include <ctime>
 
 struct Task {
-    std::function<void()> func;
+    std::function<void(const std::atomic<bool>&)> func; 
     int duration_sec; 
     std::chrono::steady_clock::time_point arrival_time;
     int id;
 
-    // Пріоритет для priority_queue: коротші задачі мають вищий пріоритет (min-heap)
+    // Коротші задачі мають вищий пріоритет (SJF)
     bool operator>(const Task& other) const {
         return duration_sec > other.duration_sec;
     }
@@ -32,12 +33,14 @@ private:
     std::condition_variable cv;
     
     std::atomic<bool> stop{false};
+    std::atomic<bool> abort_requested{false};
     std::atomic<bool> paused{false};
 
-    std::atomic<long long> total_idle_time_ms{0}; // Час очікування воркерів
-    std::atomic<long long> total_exec_time_ms{0}; // Час виконання задач
-    std::atomic<int> tasks_completed{0}; // Кількість виконаних задач
-    std::atomic<int> tasks_transferred{0}; // Задачі, перенесені в Q2
+    // Метрики
+    std::atomic<long long> total_idle_time_ms{0};
+    std::atomic<long long> total_exec_time_ms{0};
+    std::atomic<int> tasks_completed{0};
+    std::atomic<int> tasks_transferred{0};
     
     std::vector<size_t> q1_sizes;
     std::vector<size_t> q2_sizes;
@@ -45,19 +48,16 @@ private:
 
 public:
     ThreadPool(int threads_q1, int threads_q2) {
-        // Ініціалізація воркерів для обох черг
-        for (int i = 0; i < threads_q1; ++i) 
-            workers.emplace_back([this] { worker_routine(1); });
-        
-        for (int i = 0; i < threads_q2; ++i) 
-            workers.emplace_back([this] { worker_routine(2); });
+        // Створення воркерів з прив'язкою до основної черги
+        for (int i = 0; i < threads_q1; ++i) workers.emplace_back([this] { worker_routine(1); });
+        for (int i = 0; i < threads_q2; ++i) workers.emplace_back([this] { worker_routine(2); });
 
         monitor_thread = std::thread([this] {
-            while (!stop) {
+            while (!stop && !abort_requested) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
                 transfer_stale_tasks();
                 
-                std::unique_lock<std::mutex> lock(mtx);
+                std::lock_guard<std::mutex> lock(mtx);
                 q1_sizes.push_back(queue1.size());
                 q2_sizes.push_back(queue2.size());
             }
@@ -65,166 +65,169 @@ public:
     }
 
     ~ThreadPool() {
-        terminate();
-        if (monitor_thread.joinable()) monitor_thread.join();
+        if (!stop && !abort_requested) {
+            terminate();
+        }
+        if (monitor_thread.joinable()) {
+            monitor_thread.join();
+        }
     }
 
+    // Інтерфейс додавання задач
     void add_task(int id, int duration) {
         std::unique_lock<std::mutex> lock(mtx);
-        Task t{
-            [id, duration] {
-                std::this_thread::sleep_for(std::chrono::seconds(duration));
-            },
-            duration,
-            std::chrono::steady_clock::now(),
-            id
+        if (stop || abort_requested) return;
+
+        auto task_logic = [id, duration](const std::atomic<bool>& cancelled) {
+            for (int s = 0; s < duration; ++s) {
+                if (cancelled) return; // Миттєвий вихід при abort
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
         };
-        queue1.push(t);
+
+        queue1.push({task_logic, duration, std::chrono::steady_clock::now(), id});
         cv.notify_all();
     }
 
     void toggle_pause() { 
         paused = !paused; 
         if (!paused) cv.notify_all(); 
-        std::cout << (paused ? "== Pool Paused ==" : "== Pool Resumed ==") << std::endl;
+        std::cout << (paused ? "\n[System] POOL PAUSED" : "\n[System] POOL RESUMED") << std::endl;
     }
 
+    // М'яка зупинка: дочекатися завершення черг
     void terminate() {
         stop = true;
         cv.notify_all();
-        for (std::thread &worker : workers) {
-            if (worker.joinable()) worker.join();
-        }
+        join_all_workers();
     }
 
-    // Вивід метрик
+    // Жорстка зупинка: очистити черги та перервати активні задачі
+    void abort() {
+        abort_requested = true;
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            while(!queue1.empty()) queue1.pop();
+            while(!queue2.empty()) queue2.pop();
+        }
+        std::cout << "\n[System] ABORTING (clearing queues & signals sent)..." << std::endl;
+        cv.notify_all();
+        join_all_workers();
+    }
+
     void print_statistics() {
-        std::unique_lock<std::mutex> lock(mtx);
+        std::lock_guard<std::mutex> lock(mtx);
         double avg_q1 = 0, avg_q2 = 0;
         for (auto s : q1_sizes) avg_q1 += s;
         for (auto s : q2_sizes) avg_q2 += s;
         
-        int num_workers = workers.size();
-        
-        std::cout << "1. Total Workers: " << num_workers << std::endl;
-        std::cout << "2. Tasks Completed: " << tasks_completed << std::endl;
-        std::cout << "3. Tasks Transferred to Q2: " << tasks_transferred << std::endl;
-        
+        std::cout << "Workers: " << workers.size() << std::endl;
+        std::cout << "Completed: " << tasks_completed.load() << std::endl;
+        std::cout << "Moved to Q2: " << tasks_transferred.load() << std::endl;
         if (!q1_sizes.empty()) {
-            std::cout << "4. Avg Queue 1 Length: " << std::fixed << std::setprecision(2) << avg_q1 / q1_sizes.size() << std::endl;
-            std::cout << "5. Avg Queue 2 Length: " << avg_q2 / q2_sizes.size() << std::endl;
+            std::cout << "Avg Q1 Length: " << std::fixed << std::setprecision(2) << avg_q1 / q1_sizes.size() << std::endl;
+            std::cout << "Avg Q2 Length: " << avg_q2 / q2_sizes.size() << std::endl;
         }
-        
         if (tasks_completed > 0) {
-            std::cout << "6. Avg Task Execution Time: " << (total_exec_time_ms / tasks_completed) / 1000.0 << "s" << std::endl;
+            std::cout << "Avg Exec Time: " << (total_exec_time_ms.load() / tasks_completed.load()) / 1000.0 << "s" << std::endl;
         }
-        
-        std::cout << "7. Avg Worker Idle Time: " << (total_idle_time_ms / num_workers) / 1000.0 << "s" << std::endl;
     }
 
 private:
-    void transfer_stale_tasks() {
-        std::unique_lock<std::mutex> lock(mtx);
-        if (queue1.empty()) return;
-
-        std::vector<Task> remaining;
-        auto now = std::chrono::steady_clock::now();
-
-        while (!queue1.empty()) {
-            Task t = queue1.top();
-            queue1.pop();
-            
-            auto wait_time = std::chrono::duration_cast<std::chrono::seconds>(now - t.arrival_time).count();
-            
-            // Якщо час очікування > 2 * час виконання, то переносимо в Q2
-            if (wait_time > (t.duration_sec * 2)) {
-                std::cout << "[Monitor] Task " << t.id << " moved to Q2 (waited " << wait_time << "s)" << std::endl;
-                queue2.push(t);
-                tasks_transferred++;
-            } else {
-                remaining.push_back(t);
-            }
+    void join_all_workers() {
+        for (auto &w : workers) {
+            if (w.joinable()) w.join();
         }
-        for (auto& t : remaining) queue1.push(t);
-        if (!queue2.empty()) cv.notify_all();
+        workers.clear();
     }
 
-    void worker_routine(int queue_id) {
+    void transfer_stale_tasks() {
+        std::vector<Task> stay;
+        std::vector<Task> move;
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            auto now = std::chrono::steady_clock::now();
+            while (!queue1.empty()) {
+                Task t = queue1.top();
+                queue1.pop();
+                auto wait = std::chrono::duration_cast<std::chrono::seconds>(now - t.arrival_time).count();
+                
+                if (wait > (t.duration_sec * 2)) move.push_back(t);
+                else stay.push_back(t);
+            }
+            for (auto& t : stay) queue1.push(t);
+            for (auto& t : move) {
+                queue2.push(t);
+                tasks_transferred++;
+                std::cout << "[Monitor] Task " << t.id << " moved to Q2 (Wait timeout)\n";
+            }
+        }
+        if (!move.empty()) cv.notify_all();
+    }
+
+    void worker_routine(int pref_q) {
         while (true) {
             Task task;
             {
                 std::unique_lock<std::mutex> lock(mtx);
-                
                 auto start_wait = std::chrono::steady_clock::now();
                 
-                // Використання умовної змінної для очікування задач
-                cv.wait(lock, [this, queue_id] {
-                    if (stop) return true;
-                    if (paused) return false;
-                    return (queue_id == 1 && !queue1.empty()) || (queue_id == 2 && !queue2.empty());
+                cv.wait(lock, [this] {
+                    bool has_work = !queue1.empty() || !queue2.empty();
+                    return stop || abort_requested || (!paused && has_work);
                 });
 
-                auto end_wait = std::chrono::steady_clock::now();
-                total_idle_time_ms += std::chrono::duration_cast<std::chrono::milliseconds>(end_wait - start_wait).count();
+                total_idle_time_ms += std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start_wait).count();
 
+                if (abort_requested) return;
                 if (stop && queue1.empty() && queue2.empty()) return;
 
-                if (queue_id == 1 && !queue1.empty()) {
-                    task = queue1.top();
-                    queue1.pop();
-                } else if (queue_id == 2 && !queue2.empty()) {
-                    task = queue2.front();
-                    queue2.pop();
-                } else continue;
+                // Fallback логіка: спочатку своя черга, якщо порожня — інша
+                if (pref_q == 1) {
+                    if (!queue1.empty()) { task = queue1.top(); queue1.pop(); }
+                    else if (!queue2.empty()) { task = queue2.front(); queue2.pop(); }
+                    else continue;
+                } else {
+                    if (!queue2.empty()) { task = queue2.front(); queue2.pop(); }
+                    else if (!queue1.empty()) { task = queue1.top(); queue1.pop(); }
+                    else continue;
+                }
             }
 
             auto start_exec = std::chrono::steady_clock::now();
-            std::cout << "[Worker Q" << queue_id << "] Processing Task " << task.id << " (" << task.duration_sec << "s)..." << std::endl;
+            std::cout << "[Worker Q" << pref_q << "] Running Task " << task.id << " (" << task.duration_sec << "s)\n";
             
-            task.func();
+            task.func(abort_requested); // Виконання з перевіркою на abort
             
-            auto end_exec = std::chrono::steady_clock::now();
-            total_exec_time_ms += std::chrono::duration_cast<std::chrono::milliseconds>(end_exec - start_exec).count();
-            tasks_completed++;
-            
-            std::cout << "[Worker Q" << queue_id << "] Finished Task " << task.id << std::endl;
+            total_exec_time_ms += std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start_exec).count();
+            if (!abort_requested) tasks_completed++;
         }
     }
 };
 
 int main() {
-    srand(time(0));
+    srand(static_cast<unsigned>(time(0)));
     ThreadPool pool(3, 1);
 
-    std::thread producer1([&pool] {
-        for (int i = 1; i <= 5; ++i) {
-            int dur = 5 + rand() % 6; // 5-10 сек
-            pool.add_task(i, dur);
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+    auto producer = [&](int start_id) {
+        for (int i = start_id; i < start_id + 5; ++i) {
+            pool.add_task(i, 5 + rand() % 6);
+            std::this_thread::sleep_for(std::chrono::milliseconds(800));
         }
-    });
+    };
 
-    std::thread producer2([&pool] {
-        for (int i = 6; i <= 10; ++i) {
-            int dur = 5 + rand() % 6;
-            pool.add_task(i, dur);
-            std::this_thread::sleep_for(std::chrono::milliseconds(1500));
-        }
-    });
+    std::thread p1(producer, 1);
+    std::thread p2(producer, 10);
+    p1.join(); p2.join();
 
-    producer1.join();
-    producer2.join();
-
-    // Даємо час на виконання та демонстрацію перенесення задач
-    std::this_thread::sleep_for(std::chrono::seconds(15));
-    pool.toggle_pause();
     std::this_thread::sleep_for(std::chrono::seconds(5));
     pool.toggle_pause();
-
-    std::cout << "Waiting for all tasks to finish..." << std::endl;
-    std::this_thread::sleep_for(std::chrono::seconds(30));
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+    pool.toggle_pause();
+    
+    std::cout << "[Main] Shutting down pool..." << std::endl;
+    pool.abort(); 
 
     pool.print_statistics();
-    
     return 0;
 }
